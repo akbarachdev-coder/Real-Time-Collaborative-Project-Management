@@ -3,9 +3,9 @@ package models
 import "time"
 
 const (
-	NotificationTaskAssigned = "task_assigned"
-	NotificationCommentAdded = "comment_added"
-	NotificationMemberAdded  = "member_added"
+	NotificationTaskAssigned  = "task_assigned"
+	NotificationCommentAdded  = "comment_added"
+	NotificationMemberAdded   = "member_added"
 	NotificationMemberRemoved = "member_removed"
 )
 

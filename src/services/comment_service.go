@@ -1,6 +1,7 @@
 package services
 
 import (
+	"encoding/json"
 	"fmt"
 	"strings"
 	"time"
@@ -22,12 +23,14 @@ func NewCommentService(db *gorm.DB, hub *realtime.Hub) *CommentService {
 }
 
 type CreateCommentRequest struct {
-	Content string `json:"content" binding:"required,max=5000"`
+	Content  string `json:"content" binding:"required,max=5000"`
+	ParentID *uint  `json:"parent_id"`
 }
 
 type CommentResponse struct {
 	ID        uint      `json:"id"`
 	TaskID    uint      `json:"task_id"`
+	ParentID  *uint     `json:"parent_id"`
 	Content   string    `json:"content"`
 	User      UserBrief `json:"user"`
 	CreatedAt time.Time `json:"created_at"`
@@ -43,6 +46,7 @@ func (s *CommentService) List(taskID, userID uint) ([]CommentResponse, error) {
 	var rows []struct {
 		ID        uint
 		TaskID    uint
+		ParentID  *uint
 		Content   string
 		CreatedAt time.Time
 		UpdatedAt time.Time
@@ -51,7 +55,7 @@ func (s *CommentService) List(taskID, userID uint) ([]CommentResponse, error) {
 		Avatar    string
 	}
 	err = s.db.Table("comments").
-		Select("comments.id, comments.task_id, comments.content, comments.created_at, comments.updated_at, comments.user_id, users.name, users.avatar").
+		Select("comments.id, comments.task_id, comments.parent_id, comments.content, comments.created_at, comments.updated_at, comments.user_id, users.name, users.avatar").
 		Joins("JOIN users ON users.id = comments.user_id").
 		Where("comments.task_id = ?", task.ID).
 		Order("comments.created_at ASC").
@@ -65,7 +69,8 @@ func (s *CommentService) List(taskID, userID uint) ([]CommentResponse, error) {
 		out = append(out, CommentResponse{
 			ID:        r.ID,
 			TaskID:    r.TaskID,
-			Content:   r.Content,
+			ParentID:  r.ParentID,
+			Content:   decodeCommentContent(r.Content),
 			User:      UserBrief{ID: r.UserID, Name: r.Name, Avatar: r.Avatar},
 			CreatedAt: r.CreatedAt,
 			UpdatedAt: r.UpdatedAt,
@@ -75,7 +80,7 @@ func (s *CommentService) List(taskID, userID uint) ([]CommentResponse, error) {
 }
 
 func (s *CommentService) Create(taskID, userID uint, req CreateCommentRequest) (*CommentResponse, error) {
-	task, err := s.loadTask(taskID, userID)
+	task, workspaceID, err := s.loadTaskWithWorkspace(taskID, userID)
 	if err != nil {
 		return nil, err
 	}
@@ -85,15 +90,34 @@ func (s *CommentService) Create(taskID, userID uint, req CreateCommentRequest) (
 		return nil, utils.BadRequest("comment content cannot be empty")
 	}
 
+	// Store content as a JSON string value (schema: content JSON NOT NULL).
+	encoded, err := json.Marshal(content)
+	if err != nil {
+		return nil, utils.Internal()
+	}
+
+	if req.ParentID != nil {
+		var parentCount int64
+		if err := s.db.Model(&models.Comment{}).
+			Where("id = ? AND task_id = ?", *req.ParentID, task.ID).
+			Count(&parentCount).Error; err != nil {
+			return nil, utils.Internal()
+		}
+		if parentCount == 0 {
+			return nil, utils.BadRequest("parent comment not found on this task")
+		}
+	}
+
 	var actor models.User
 	if err := s.db.First(&actor, userID).Error; err != nil {
 		return nil, utils.Internal()
 	}
 
 	comment := models.Comment{
-		TaskID:  task.ID,
-		UserID:  userID,
-		Content: content,
+		TaskID:   task.ID,
+		UserID:   userID,
+		ParentID: req.ParentID,
+		Content:  string(encoded),
 	}
 	if err := s.db.Create(&comment).Error; err != nil {
 		return nil, utils.Internal()
@@ -102,11 +126,16 @@ func (s *CommentService) Create(taskID, userID uint, req CreateCommentRequest) (
 	resp := &CommentResponse{
 		ID:        comment.ID,
 		TaskID:    comment.TaskID,
-		Content:   comment.Content,
+		ParentID:  comment.ParentID,
+		Content:   content,
 		User:      UserBrief{ID: actor.ID, Name: actor.Name, Avatar: actor.Avatar},
 		CreatedAt: comment.CreatedAt,
 		UpdatedAt: comment.UpdatedAt,
 	}
+
+	LogActivity(s.db, workspaceID, ptr(task.ProjectID), ptr(task.ID), ptr(userID), "comment.created", map[string]any{
+		"comment_id": comment.ID,
+	})
 
 	s.hub.BroadcastToProject(task.ProjectID, realtime.Message{
 		Type:      "comment.created",
@@ -114,18 +143,18 @@ func (s *CommentService) Create(taskID, userID uint, req CreateCommentRequest) (
 		Data:      resp,
 	})
 
-	message := fmt.Sprintf("%s commented on task %q", actor.Name, task.Title)
-	projectID := task.ProjectID
-	taskIDVal := task.ID
+	message := fmt.Sprintf("%s commented on task #%d", actor.Name, task.TaskNumber)
 	notified := map[uint]bool{userID: true}
-	if task.AssigneeID != nil && !notified[*task.AssigneeID] {
-		notified[*task.AssigneeID] = true
-		createNotification(s.db, s.hub, *task.AssigneeID, models.NotificationCommentAdded,
-			message, &projectID, &taskIDVal)
+	for _, uid := range s.assigneeIDs(task.ID) {
+		if !notified[uid] {
+			notified[uid] = true
+			createNotification(s.db, s.hub, uid, models.NotificationCommentAdded,
+				message, ptr(task.ProjectID), ptr(task.ID))
+		}
 	}
-	if !notified[task.CreatedBy] {
-		createNotification(s.db, s.hub, task.CreatedBy, models.NotificationCommentAdded,
-			message, &projectID, &taskIDVal)
+	if task.ReporterID != nil && !notified[*task.ReporterID] {
+		createNotification(s.db, s.hub, *task.ReporterID, models.NotificationCommentAdded,
+			message, ptr(task.ProjectID), ptr(task.ID))
 	}
 	return resp, nil
 }
@@ -139,17 +168,24 @@ func (s *CommentService) Delete(commentID, userID uint) error {
 		return utils.Forbidden("you can only delete your own comments")
 	}
 
-	var task models.Task
-	if err := s.db.First(&task, comment.TaskID).Error; err != nil {
-		return utils.Internal()
-	}
-	if err := RequireProjectMember(s.db, task.ProjectID, userID); err != nil {
+	task, workspaceID, err := s.loadTaskWithWorkspace(comment.TaskID, userID)
+	if err != nil {
 		return err
 	}
 
-	if err := s.db.Delete(&comment).Error; err != nil {
+	err = s.db.Transaction(func(tx *gorm.DB) error {
+		if err := tx.Where("parent_id = ?", comment.ID).Delete(&models.Comment{}).Error; err != nil {
+			return err
+		}
+		return tx.Delete(&comment).Error
+	})
+	if err != nil {
 		return utils.Internal()
 	}
+
+	LogActivity(s.db, workspaceID, ptr(task.ProjectID), ptr(task.ID), ptr(userID), "comment.deleted", map[string]any{
+		"comment_id": comment.ID,
+	})
 
 	s.hub.BroadcastToProject(task.ProjectID, realtime.Message{
 		Type:      "comment.deleted",
@@ -160,12 +196,37 @@ func (s *CommentService) Delete(commentID, userID uint) error {
 }
 
 func (s *CommentService) loadTask(taskID, userID uint) (*models.Task, error) {
+	task, _, err := s.loadTaskWithWorkspace(taskID, userID)
+	return task, err
+}
+
+func (s *CommentService) loadTaskWithWorkspace(taskID, userID uint) (*models.Task, uint, error) {
 	var task models.Task
 	if err := s.db.First(&task, taskID).Error; err != nil {
-		return nil, utils.NotFound("task not found")
+		return nil, 0, utils.NotFound("task not found")
 	}
-	if err := RequireProjectMember(s.db, task.ProjectID, userID); err != nil {
-		return nil, err
+	workspaceID, err := workspaceIDForProject(s.db, task.ProjectID, userID)
+	if err != nil {
+		return nil, 0, err
 	}
-	return &task, nil
+	return &task, workspaceID, nil
+}
+
+func (s *CommentService) assigneeIDs(taskID uint) []uint {
+	var rows []uint
+	if err := s.db.Model(&models.TaskAssignee{}).
+		Where("task_id = ?", taskID).
+		Pluck("user_id", &rows).Error; err != nil {
+		return nil
+	}
+	return rows
+}
+
+// decodeCommentContent unwraps a JSON-encoded string stored in content.
+func decodeCommentContent(raw string) string {
+	var s string
+	if err := json.Unmarshal([]byte(raw), &s); err == nil {
+		return s
+	}
+	return raw
 }

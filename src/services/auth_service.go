@@ -42,7 +42,7 @@ type AuthResponse struct {
 }
 
 func (s *AuthService) Register(req RegisterRequest) (*AuthResponse, error) {
-	email := normalizeEmail(req.Email)
+	email := authNormalizeEmail(req.Email)
 	if email == "" {
 		return nil, utils.BadRequest("invalid email")
 	}
@@ -75,7 +75,7 @@ func (s *AuthService) Register(req RegisterRequest) (*AuthResponse, error) {
 }
 
 func (s *AuthService) Login(req LoginRequest) (*AuthResponse, error) {
-	email := normalizeEmail(req.Email)
+	email := authNormalizeEmail(req.Email)
 
 	var user models.User
 	err := s.db.Where("email = ?", email).First(&user).Error
@@ -121,7 +121,7 @@ func (s *AuthService) issueTokens(user models.User) (*AuthResponse, error) {
 	}, nil
 }
 
-func normalizeEmail(email string) string {
+func authNormalizeEmail(email string) string {
 	return strings.ToLower(strings.TrimSpace(email))
 }
 

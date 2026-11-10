@@ -11,12 +11,12 @@ import (
 )
 
 const (
-	writeWait       = 10 * time.Second
-	pongWait        = 60 * time.Second
-	pingPeriod      = 54 * time.Second
-	maxMessageSize  = 8192
-	sendBufferSize  = 256
-	enqueueDropped  = "realtime: dropped message, client send buffer full"
+	writeWait      = 10 * time.Second
+	pongWait       = 60 * time.Second
+	pingPeriod     = 54 * time.Second
+	maxMessageSize = 8192
+	sendBufferSize = 256
+	enqueueDropped = "realtime: dropped message, client send buffer full"
 )
 
 type Message struct {

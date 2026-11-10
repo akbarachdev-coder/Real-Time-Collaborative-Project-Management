@@ -1,6 +1,7 @@
 package services
 
 import (
+	"encoding/json"
 	"fmt"
 	"strings"
 	"time"
@@ -12,11 +13,22 @@ import (
 	"gorm.io/gorm"
 )
 
-var validStatuses = map[string]bool{
-	models.TaskStatusTodo:       true,
-	models.TaskStatusInProgress: true,
-	models.TaskStatusReview:     true,
-	models.TaskStatusDone:       true,
+// encodeJSONString stores a plain string as a JSON string value (schema: JSON column).
+func encodeJSONString(s string) string {
+	b, err := json.Marshal(s)
+	if err != nil {
+		return `""`
+	}
+	return string(b)
+}
+
+// decodeJSONString unwaps a JSON-encoded string; returns raw on failure.
+func decodeJSONString(raw string) string {
+	var s string
+	if err := json.Unmarshal([]byte(raw), &s); err == nil {
+		return s
+	}
+	return raw
 }
 
 type TaskService struct {
@@ -29,20 +41,22 @@ func NewTaskService(db *gorm.DB, hub *realtime.Hub) *TaskService {
 }
 
 type CreateTaskRequest struct {
-	Title       string     `json:"title" binding:"required,max=200"`
+	Title       string     `json:"title" binding:"required,max=500"`
 	Description string     `json:"description" binding:"max=10000"`
-	Status      string     `json:"status" binding:"omitempty,oneof=todo in_progress review done"`
+	StatusID    *uint      `json:"status_id"`
+	Priority    string     `json:"priority" binding:"omitempty,oneof=LOW MEDIUM HIGH URGENT"`
 	AssigneeID  *uint      `json:"assignee_id"`
 	DueDate     *time.Time `json:"due_date"`
 }
 
 type UpdateTaskRequest struct {
-	Title       *string          `json:"title" binding:"omitempty,max=200"`
-	Description *string          `json:"description" binding:"omitempty,max=10000"`
-	Status      *string          `json:"status" binding:"omitempty,oneof=todo in_progress review done"`
-	Position    *float64         `json:"position"`
-	AssigneeID  *utils.NullUint  `json:"assignee_id"`
-	DueDate     *utils.NullTime  `json:"due_date"`
+	Title       *string         `json:"title" binding:"omitempty,min=1,max=500"`
+	Description *string         `json:"description" binding:"omitempty,max=10000"`
+	StatusID    *uint           `json:"status_id"`
+	Priority    *string         `json:"priority" binding:"omitempty,oneof=LOW MEDIUM HIGH URGENT"`
+	Position    *float64        `json:"position"`
+	AssigneeID  *utils.NullUint `json:"assignee_id"`
+	DueDate     *utils.NullTime `json:"due_date"`
 }
 
 type UserBrief struct {
@@ -51,22 +65,31 @@ type UserBrief struct {
 	Avatar string `json:"avatar"`
 }
 
+type TaskStatusBrief struct {
+	ID    uint   `json:"id"`
+	Name  string `json:"name"`
+	Color string `json:"color"`
+}
+
 type TaskResponse struct {
-	ID          uint       `json:"id"`
-	ProjectID   uint       `json:"project_id"`
-	Title       string     `json:"title"`
-	Description string     `json:"description"`
-	Status      string     `json:"status"`
-	Position    float64    `json:"position"`
-	Assignee    *UserBrief `json:"assignee"`
-	DueDate     *time.Time `json:"due_date"`
-	CreatedBy   uint       `json:"created_by"`
-	CreatedAt   time.Time  `json:"created_at"`
-	UpdatedAt   time.Time  `json:"updated_at"`
+	ID          uint             `json:"id"`
+	ProjectID   uint             `json:"project_id"`
+	TaskNumber  int              `json:"task_number"`
+	Title       string           `json:"title"`
+	Description string           `json:"description"`
+	StatusID    uint             `json:"status_id"`
+	Status      *TaskStatusBrief `json:"status"`
+	Priority    string           `json:"priority"`
+	Position    float64          `json:"position"`
+	Assignee    *UserBrief       `json:"assignee"`
+	DueDate     *time.Time       `json:"due_date"`
+	ReporterID  *uint            `json:"reporter_id"`
+	CreatedAt   time.Time        `json:"created_at"`
+	UpdatedAt   time.Time        `json:"updated_at"`
 }
 
 func (s *TaskService) ListByProject(projectID, userID uint) ([]TaskResponse, error) {
-	if err := RequireProjectMember(s.db, projectID, userID); err != nil {
+	if _, err := workspaceIDForProject(s.db, projectID, userID); err != nil {
 		return nil, err
 	}
 
@@ -78,33 +101,25 @@ func (s *TaskService) ListByProject(projectID, userID uint) ([]TaskResponse, err
 		return nil, utils.Internal()
 	}
 
-	assignees, err := s.loadAssignees(tasks)
-	if err != nil {
-		return nil, err
-	}
-
-	out := make([]TaskResponse, 0, len(tasks))
-	for _, t := range tasks {
-		out = append(out, buildTaskResponse(t, assignees))
-	}
-	return out, nil
+	return s.buildResponses(projectID, tasks)
 }
 
 func (s *TaskService) Get(taskID, userID uint) (*TaskResponse, error) {
-	task, err := s.load(taskID, userID)
+	task, workspaceID, err := s.load(taskID, userID)
 	if err != nil {
 		return nil, err
 	}
-	assignees, err := s.loadAssignees([]models.Task{*task})
+	_ = workspaceID
+	responses, err := s.buildResponses(task.ProjectID, []models.Task{*task})
 	if err != nil {
 		return nil, err
 	}
-	resp := buildTaskResponse(*task, assignees)
-	return &resp, nil
+	return &responses[0], nil
 }
 
 func (s *TaskService) Create(projectID, userID uint, req CreateTaskRequest) (*TaskResponse, error) {
-	if err := RequireProjectMember(s.db, projectID, userID); err != nil {
+	workspaceID, err := workspaceIDForProject(s.db, projectID, userID)
+	if err != nil {
 		return nil, err
 	}
 
@@ -113,64 +128,99 @@ func (s *TaskService) Create(projectID, userID uint, req CreateTaskRequest) (*Ta
 		return nil, utils.BadRequest("title cannot be empty")
 	}
 
-	status := req.Status
-	if status == "" {
-		status = models.TaskStatusTodo
+	priority := req.Priority
+	if priority == "" {
+		priority = models.PriorityMedium
 	}
-	if !validStatuses[status] {
-		return nil, utils.BadRequest("invalid status")
+	if !models.IsValidPriority(priority) {
+		return nil, utils.BadRequest("invalid priority")
+	}
+
+	statusID, err := s.resolveStatusID(projectID, req.StatusID)
+	if err != nil {
+		return nil, err
 	}
 
 	if req.AssigneeID != nil {
-		if err := s.validateAssignee(projectID, *req.AssigneeID); err != nil {
+		if err := s.validateAssignee(workspaceID, *req.AssigneeID); err != nil {
 			return nil, err
 		}
 	}
 
-	pos, err := s.maxPosition(projectID, status)
+	var task models.Task
+	err = s.db.Transaction(func(tx *gorm.DB) error {
+		var maxNum int
+		if err := tx.Model(&models.Task{}).
+			Where("project_id = ?", projectID).
+			Select("COALESCE(MAX(task_number), 0)").
+			Scan(&maxNum).Error; err != nil {
+			return err
+		}
+
+		var maxPos float64
+		if err := tx.Model(&models.Task{}).
+			Where("project_id = ? AND status_id = ?", projectID, statusID).
+			Select("COALESCE(MAX(position), 0)").
+			Scan(&maxPos).Error; err != nil {
+			return err
+		}
+
+		task = models.Task{
+			ProjectID:   projectID,
+			StatusID:    statusID,
+			TaskNumber:  maxNum + 1,
+			Title:       title,
+			Description: encodeJSONString(req.Description),
+			Priority:    priority,
+			Position:    maxPos + 1,
+			DueDate:     req.DueDate,
+			ReporterID:  ptr(userID),
+		}
+		if err := tx.Create(&task).Error; err != nil {
+			return err
+		}
+		if req.AssigneeID != nil {
+			return tx.Create(&models.TaskAssignee{
+				TaskID: task.ID,
+				UserID: *req.AssigneeID,
+			}).Error
+		}
+		return nil
+	})
 	if err != nil {
 		return nil, utils.Internal()
 	}
 
-	task := models.Task{
-		ProjectID:   projectID,
-		Title:       title,
-		Description: req.Description,
-		Status:      status,
-		Position:    pos + 1,
-		AssigneeID:  req.AssigneeID,
-		DueDate:     req.DueDate,
-		CreatedBy:   userID,
-	}
-	if err := s.db.Create(&task).Error; err != nil {
-		return nil, utils.Internal()
-	}
-
-	assignees, err := s.loadAssignees([]models.Task{task})
+	responses, err := s.buildResponses(projectID, []models.Task{task})
 	if err != nil {
 		return nil, err
 	}
-	resp := buildTaskResponse(task, assignees)
+	resp := responses[0]
 
+	LogActivity(s.db, workspaceID, ptr(projectID), ptr(task.ID), ptr(userID), "task.created", map[string]any{
+		"task_id":     task.ID,
+		"task_number": task.TaskNumber,
+		"title":       task.Title,
+	})
 	s.hub.BroadcastToProject(projectID, realtime.Message{
 		Type:      "task.created",
 		ProjectID: projectID,
 		Data:      resp,
 	})
-	if task.AssigneeID != nil && *task.AssigneeID != userID {
-		s.notifyAssigned(task)
+	if task.ReporterID != nil && resp.Assignee != nil && resp.Assignee.ID != userID {
+		s.notifyAssigned(projectID, task, resp.Assignee.ID)
 	}
 	return &resp, nil
 }
 
 func (s *TaskService) Update(taskID, userID uint, req UpdateTaskRequest) (*TaskResponse, error) {
-	task, err := s.load(taskID, userID)
+	task, workspaceID, err := s.load(taskID, userID)
 	if err != nil {
 		return nil, err
 	}
 
-	oldStatus := task.Status
-	oldAssignee := task.AssigneeID
+	oldStatusID := task.StatusID
+	oldAssignee := s.primaryAssignee(task.ID)
 
 	if req.Title != nil {
 		title := strings.TrimSpace(*req.Title)
@@ -180,24 +230,20 @@ func (s *TaskService) Update(taskID, userID uint, req UpdateTaskRequest) (*TaskR
 		task.Title = title
 	}
 	if req.Description != nil {
-		task.Description = *req.Description
+		task.Description = encodeJSONString(*req.Description)
 	}
-	if req.Status != nil {
-		if !validStatuses[*req.Status] {
-			return nil, utils.BadRequest("invalid status")
+	if req.StatusID != nil {
+		statusID, err := s.resolveStatusID(task.ProjectID, req.StatusID)
+		if err != nil {
+			return nil, err
 		}
-		task.Status = *req.Status
+		task.StatusID = statusID
 	}
-	if req.AssigneeID != nil {
-		if req.AssigneeID.Valid {
-			if err := s.validateAssignee(task.ProjectID, req.AssigneeID.Value); err != nil {
-				return nil, err
-			}
-			v := req.AssigneeID.Value
-			task.AssigneeID = &v
-		} else {
-			task.AssigneeID = nil
+	if req.Priority != nil {
+		if !models.IsValidPriority(*req.Priority) {
+			return nil, utils.BadRequest("invalid priority")
 		}
+		task.Priority = *req.Priority
 	}
 	if req.DueDate != nil {
 		if req.DueDate.Valid {
@@ -208,46 +254,99 @@ func (s *TaskService) Update(taskID, userID uint, req UpdateTaskRequest) (*TaskR
 		}
 	}
 
+	if req.AssigneeID != nil {
+		if req.AssigneeID.Valid {
+			if err := s.validateAssignee(workspaceID, req.AssigneeID.Value); err != nil {
+				return nil, err
+			}
+			v := req.AssigneeID.Value
+			if err := s.db.Transaction(func(tx *gorm.DB) error {
+				if err := tx.Where("task_id = ?", task.ID).Delete(&models.TaskAssignee{}).Error; err != nil {
+					return err
+				}
+				return tx.Create(&models.TaskAssignee{TaskID: task.ID, UserID: v}).Error
+			}); err != nil {
+				return nil, utils.Internal()
+			}
+		} else {
+			if err := s.db.Where("task_id = ?", task.ID).Delete(&models.TaskAssignee{}).Error; err != nil {
+				return nil, utils.Internal()
+			}
+		}
+	}
+
 	if req.Position != nil {
 		task.Position = *req.Position
-	} else if req.Status != nil && task.Status != oldStatus {
-		pos, err := s.maxPosition(task.ProjectID, task.Status)
-		if err != nil {
+	} else if req.StatusID != nil && task.StatusID != oldStatusID {
+		var maxPos float64
+		if err := s.db.Model(&models.Task{}).
+			Where("project_id = ? AND status_id = ?", task.ProjectID, task.StatusID).
+			Select("COALESCE(MAX(position), 0)").
+			Scan(&maxPos).Error; err != nil {
 			return nil, utils.Internal()
 		}
-		task.Position = pos + 1
+		task.Position = maxPos + 1
 	}
 
 	if err := s.db.Save(task).Error; err != nil {
 		return nil, utils.Internal()
 	}
 
-	assignees, err := s.loadAssignees([]models.Task{*task})
+	responses, err := s.buildResponses(task.ProjectID, []models.Task{*task})
 	if err != nil {
 		return nil, err
 	}
-	resp := buildTaskResponse(*task, assignees)
+	resp := responses[0]
 
+	LogActivity(s.db, workspaceID, ptr(task.ProjectID), ptr(task.ID), ptr(userID), "task.updated", map[string]any{
+		"task_id": task.ID,
+		"fields":  taskUpdateFields(req, oldStatusID, task),
+	})
 	s.hub.BroadcastToProject(task.ProjectID, realtime.Message{
 		Type:      "task.updated",
 		ProjectID: task.ProjectID,
 		Data:      resp,
 	})
 
-	if !sameUint(task.AssigneeID, oldAssignee) && task.AssigneeID != nil && *task.AssigneeID != userID {
-		s.notifyAssigned(*task)
+	newAssignee := uint(0)
+	if resp.Assignee != nil {
+		newAssignee = resp.Assignee.ID
+	}
+	if newAssignee != 0 && newAssignee != oldAssignee && newAssignee != userID {
+		s.notifyAssigned(task.ProjectID, *task, newAssignee)
 	}
 	return &resp, nil
 }
 
 func (s *TaskService) Delete(taskID, userID uint) error {
-	task, err := s.load(taskID, userID)
+	task, workspaceID, err := s.load(taskID, userID)
 	if err != nil {
 		return err
 	}
-	if err := s.db.Delete(task).Error; err != nil {
+
+	err = s.db.Transaction(func(tx *gorm.DB) error {
+		if err := tx.Where("task_id = ?", task.ID).Delete(&models.Comment{}).Error; err != nil {
+			return err
+		}
+		if err := tx.Where("task_id = ?", task.ID).Delete(&models.TaskAssignee{}).Error; err != nil {
+			return err
+		}
+		if err := tx.Where("task_id = ?", task.ID).Delete(&models.TaskDocState{}).Error; err != nil {
+			return err
+		}
+		if err := tx.Where("task_id = ?", task.ID).Delete(&models.Notification{}).Error; err != nil {
+			return err
+		}
+		return tx.Delete(&models.Task{}, task.ID).Error
+	})
+	if err != nil {
 		return utils.Internal()
 	}
+
+	LogActivity(s.db, workspaceID, ptr(task.ProjectID), ptr(task.ID), ptr(userID), "task.deleted", map[string]any{
+		"task_id":     task.ID,
+		"task_number": task.TaskNumber,
+	})
 	s.hub.BroadcastToProject(task.ProjectID, realtime.Message{
 		Type:      "task.deleted",
 		ProjectID: task.ProjectID,
@@ -256,93 +355,185 @@ func (s *TaskService) Delete(taskID, userID uint) error {
 	return nil
 }
 
-func (s *TaskService) load(taskID, userID uint) (*models.Task, error) {
+func (s *TaskService) load(taskID, userID uint) (*models.Task, uint, error) {
 	var task models.Task
 	if err := s.db.First(&task, taskID).Error; err != nil {
-		return nil, utils.NotFound("task not found")
+		return nil, 0, utils.NotFound("task not found")
 	}
-	if err := RequireProjectMember(s.db, task.ProjectID, userID); err != nil {
-		return nil, err
+	workspaceID, err := workspaceIDForProject(s.db, task.ProjectID, userID)
+	if err != nil {
+		return nil, 0, err
 	}
-	return &task, nil
+	return &task, workspaceID, nil
 }
 
-func (s *TaskService) validateAssignee(projectID, assigneeID uint) error {
-	ok, err := IsProjectMember(s.db, projectID, assigneeID)
+func (s *TaskService) resolveStatusID(projectID uint, statusID *uint) (uint, error) {
+	if statusID != nil {
+		var count int64
+		if err := s.db.Model(&models.ProjectStatus{}).
+			Where("id = ? AND project_id = ?", *statusID, projectID).
+			Count(&count).Error; err != nil {
+			return 0, utils.Internal()
+		}
+		if count == 0 {
+			return 0, utils.BadRequest("invalid status_id for this project")
+		}
+		return *statusID, nil
+	}
+
+	var first models.ProjectStatus
+	err := s.db.Where("project_id = ?", projectID).
+		Order("position ASC, id ASC").
+		First(&first).Error
+	if err == gorm.ErrRecordNotFound {
+		return 0, utils.BadRequest("project has no statuses configured")
+	}
 	if err != nil {
+		return 0, utils.Internal()
+	}
+	return first.ID, nil
+}
+
+func (s *TaskService) validateAssignee(workspaceID, assigneeID uint) error {
+	var count int64
+	if err := s.db.Model(&models.WorkspaceMember{}).
+		Where("workspace_id = ? AND user_id = ?", workspaceID, assigneeID).
+		Count(&count).Error; err != nil {
 		return utils.Internal()
 	}
-	if !ok {
-		return utils.BadRequest("assignee must be a member of the project")
+	if count == 0 {
+		return utils.BadRequest("assignee must be a member of the workspace")
 	}
 	return nil
 }
 
-func (s *TaskService) maxPosition(projectID uint, status string) (float64, error) {
-	var pos float64
-	err := s.db.Model(&models.Task{}).
-		Where("project_id = ? AND status = ?", projectID, status).
-		Select("COALESCE(MAX(position), 0)").
-		Scan(&pos).Error
-	return pos, err
+func (s *TaskService) primaryAssignee(taskID uint) uint {
+	var assignee models.TaskAssignee
+	if err := s.db.Where("task_id = ?", taskID).First(&assignee).Error; err != nil {
+		return 0
+	}
+	return assignee.UserID
 }
 
-func (s *TaskService) loadAssignees(tasks []models.Task) (map[uint]*UserBrief, error) {
-	out := make(map[uint]*UserBrief)
-	ids := make([]uint, 0, len(tasks))
-	seen := make(map[uint]bool)
-	for _, t := range tasks {
-		if t.AssigneeID != nil && !seen[*t.AssigneeID] {
-			seen[*t.AssigneeID] = true
-			ids = append(ids, *t.AssigneeID)
-		}
-	}
-	if len(ids) == 0 {
-		return out, nil
+// buildResponses loads statuses + assignees for a batch of tasks.
+func (s *TaskService) buildResponses(projectID uint, tasks []models.Task) ([]TaskResponse, error) {
+	if len(tasks) == 0 {
+		return []TaskResponse{}, nil
 	}
 
-	var users []models.User
-	if err := s.db.Where("id IN ?", ids).Find(&users).Error; err != nil {
+	var statuses []models.ProjectStatus
+	if err := s.db.Where("project_id = ?", projectID).Find(&statuses).Error; err != nil {
 		return nil, utils.Internal()
 	}
-	for _, u := range users {
-		out[u.ID] = &UserBrief{ID: u.ID, Name: u.Name, Avatar: u.Avatar}
+	statusByID := make(map[uint]models.ProjectStatus, len(statuses))
+	for _, st := range statuses {
+		statusByID[st.ID] = st
+	}
+
+	taskIDs := make([]uint, 0, len(tasks))
+	for _, t := range tasks {
+		taskIDs = append(taskIDs, t.ID)
+	}
+
+	var assigneeRows []struct {
+		TaskID uint
+		UserID uint
+	}
+	if err := s.db.Model(&models.TaskAssignee{}).
+		Where("task_id IN ?", taskIDs).
+		Find(&assigneeRows).Error; err != nil {
+		return nil, utils.Internal()
+	}
+
+	userIDs := make([]uint, 0, len(assigneeRows))
+	seen := make(map[uint]bool, len(assigneeRows))
+	for _, r := range assigneeRows {
+		if !seen[r.UserID] {
+			seen[r.UserID] = true
+			userIDs = append(userIDs, r.UserID)
+		}
+	}
+
+	userByID := make(map[uint]UserBrief, len(userIDs))
+	if len(userIDs) > 0 {
+		var users []models.User
+		if err := s.db.Where("id IN ?", userIDs).Find(&users).Error; err != nil {
+			return nil, utils.Internal()
+		}
+		for _, u := range users {
+			userByID[u.ID] = UserBrief{ID: u.ID, Name: u.Name, Avatar: u.Avatar}
+		}
+	}
+
+	assigneeByTask := make(map[uint]UserBrief, len(assigneeRows))
+	for _, r := range assigneeRows {
+		if u, ok := userByID[r.UserID]; ok {
+			if _, exists := assigneeByTask[r.TaskID]; !exists {
+				assigneeByTask[r.TaskID] = u
+			}
+		}
+	}
+
+	out := make([]TaskResponse, 0, len(tasks))
+	for _, t := range tasks {
+		resp := TaskResponse{
+			ID:          t.ID,
+			ProjectID:   t.ProjectID,
+			TaskNumber:  t.TaskNumber,
+			Title:       t.Title,
+			Description: decodeJSONString(t.Description),
+			StatusID:    t.StatusID,
+			Priority:    t.Priority,
+			Position:    t.Position,
+			DueDate:     t.DueDate,
+			ReporterID:  t.ReporterID,
+			CreatedAt:   t.CreatedAt,
+			UpdatedAt:   t.UpdatedAt,
+		}
+		if st, ok := statusByID[t.StatusID]; ok {
+			resp.Status = &TaskStatusBrief{ID: st.ID, Name: st.Name, Color: st.Color}
+		}
+		if a, ok := assigneeByTask[t.ID]; ok {
+			aa := a
+			resp.Assignee = &aa
+		}
+		out = append(out, resp)
 	}
 	return out, nil
 }
 
-func (s *TaskService) notifyAssigned(task models.Task) {
-	projectID := task.ProjectID
-	taskID := task.ID
-	createNotification(s.db, s.hub, *task.AssigneeID, models.NotificationTaskAssigned,
-		fmt.Sprintf("You were assigned to task %q", task.Title),
-		&projectID, &taskID)
+func (s *TaskService) notifyAssigned(projectID uint, task models.Task, assigneeID uint) {
+	var project models.Project
+	title := fmt.Sprintf("You were assigned to task #%d", task.TaskNumber)
+	if err := s.db.First(&project, projectID).Error; err == nil {
+		title = fmt.Sprintf("You were assigned to %s-%d", project.Identifier, task.TaskNumber)
+	}
+	createNotification(s.db, s.hub, assigneeID, models.NotificationTaskAssigned,
+		title, ptr(projectID), ptr(task.ID))
 }
 
-func buildTaskResponse(t models.Task, assignees map[uint]*UserBrief) TaskResponse {
-	resp := TaskResponse{
-		ID:          t.ID,
-		ProjectID:   t.ProjectID,
-		Title:       t.Title,
-		Description: t.Description,
-		Status:      t.Status,
-		Position:    t.Position,
-		DueDate:     t.DueDate,
-		CreatedBy:   t.CreatedBy,
-		CreatedAt:   t.CreatedAt,
-		UpdatedAt:   t.UpdatedAt,
+func taskUpdateFields(req UpdateTaskRequest, oldStatusID uint, task *models.Task) map[string]any {
+	fields := map[string]any{}
+	if req.Title != nil {
+		fields["title"] = task.Title
 	}
-	if t.AssigneeID != nil {
-		if a, ok := assignees[*t.AssigneeID]; ok {
-			resp.Assignee = a
-		}
+	if req.Description != nil {
+		fields["description"] = true
 	}
-	return resp
-}
-
-func sameUint(a, b *uint) bool {
-	if a == nil || b == nil {
-		return a == b
+	if req.StatusID != nil && task.StatusID != oldStatusID {
+		fields["status_id"] = task.StatusID
 	}
-	return *a == *b
+	if req.Priority != nil {
+		fields["priority"] = task.Priority
+	}
+	if req.Position != nil {
+		fields["position"] = task.Position
+	}
+	if req.AssigneeID != nil {
+		fields["assignee_id"] = req.AssigneeID
+	}
+	if req.DueDate != nil {
+		fields["due_date"] = task.DueDate
+	}
+	return fields
 }

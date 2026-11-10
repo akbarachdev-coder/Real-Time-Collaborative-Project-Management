@@ -50,11 +50,16 @@ func ConnectMySQL(cfg *Config) (*gorm.DB, error) {
 
 	if err := db.AutoMigrate(
 		&models.User{},
+		&models.Workspace{},
+		&models.WorkspaceMember{},
 		&models.Project{},
-		&models.ProjectMember{},
+		&models.ProjectStatus{},
 		&models.Task{},
+		&models.TaskAssignee{},
 		&models.Comment{},
 		&models.Notification{},
+		&models.ActivityLog{},
+		&models.TaskDocState{},
 	); err != nil {
 		return nil, fmt.Errorf("auto migrate: %w", err)
 	}

@@ -4,8 +4,8 @@ services:
     container_name: collabpm-mysql
     restart: unless-stopped
     environment:
-      MYSQL_ROOT_PASSWORD: root
-      MYSQL_DATABASE: collabpm
+      MYSQL_ROOT_PASSWORD: anomali123
+      MYSQL_DATABASE: realtime_db
     ports:
       - "3306:3306"
     volumes:
