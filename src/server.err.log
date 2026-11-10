@@ -1,0 +1,1 @@
+2026/11/10 14:11:02 database: connect to mysql server: Error 1045 (28000): Access denied for user 'root'@'localhost' (using password: NO)
